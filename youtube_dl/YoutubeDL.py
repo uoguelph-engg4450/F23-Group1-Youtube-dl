@@ -847,7 +847,6 @@ class YoutubeDL(object):
             if not ie.working():
                 self.report_warning('The program functionality for this site has been marked as broken, '
                                     'and will probably not work.')
-            
             return self.__extract_info(url, ie, download, extra_info, process)
         else:
             self.report_error('no suitable InfoExtractor for URL %s' % url)
