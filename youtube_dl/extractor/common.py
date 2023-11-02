@@ -433,7 +433,7 @@ class InfoExtractor(object):
             cls._VALID_URL_RE = tuple(map(re.compile, variadic(cls._VALID_URL)))
         # 20% faster than next(filter(None, (p.match(url) for p in cls._VALID_URL_RE)), None) in 2.7
         for p in cls._VALID_URL_RE:
-            p = p.match(url)
+            p = p.match(url) 
             if p:
                 return p
 
@@ -1018,6 +1018,7 @@ class InfoExtractor(object):
         In case of failure return a default value or raise a WARNING or a
         RegexNotFoundError, depending on fatal, specifying the field name.
         """
+        print()
         if isinstance(pattern, (str, compat_str, compiled_regex_type)):
             mobj = re.search(pattern, string, flags)
         else:
@@ -1025,7 +1026,6 @@ class InfoExtractor(object):
                 mobj = re.search(p, string, flags)
                 if mobj:
                     break
-
         if not self._downloader.params.get('no_color') and compat_os_name != 'nt' and sys.stderr.isatty():
             _name = '\033[0;34m%s\033[0m' % name
         else:

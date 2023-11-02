@@ -3,7 +3,6 @@ from __future__ import unicode_literals
 
 import hashlib
 import re
-
 from .common import InfoExtractor
 from ..compat import (
     compat_parse_qs,
@@ -20,6 +19,12 @@ from ..utils import (
     unified_timestamp,
     unsmuggle_url,
     urlencode_postdata,
+    traverse_obj,
+    srt_subtitles_timecode,
+    filter_dict,
+    merge_dicts,
+    itertools,
+    base64
 )
 
 
@@ -303,7 +308,6 @@ class BiliBiliBangumiIE(InfoExtractor):
 
     def _real_extract(self, url):
         bangumi_id = self._match_id(url)
-
         # Sometimes this API returns a JSONP response
         season_info = self._download_json(
             'http://bangumi.bilibili.com/jsonp/seasoninfo/%s.ver' % bangumi_id,
@@ -454,3 +458,421 @@ class BiliBiliPlayerIE(InfoExtractor):
         return self.url_result(
             'http://www.bilibili.tv/video/av%s/' % video_id,
             ie=BiliBiliIE.ie_key(), video_id=video_id)
+
+
+class BiliIntlBaseIE(InfoExtractor):
+    _API_URL = 'https://api.bilibili.tv/intl/gateway'
+    _NETRC_MACHINE = 'biliintl'
+
+    def _call_api(self, endpoint, *args, **kwargs):
+        json = self._download_json(self._API_URL + endpoint, *args, **kwargs)
+        if json.get('code'):
+            if json['code'] in (10004004, 10004005, 10023006):
+                self.raise_login_required()
+            elif json['code'] == 10004001:
+                self.raise_geo_restricted()
+            else:
+                if json.get('message') and str(json['code']) != json['message']:
+                    errmsg = f'{kwargs.get("errnote", "Unable to download JSON metadata")}: {self.IE_NAME} said: {json["message"]}'
+                else:
+                    errmsg = kwargs.get('errnote', 'Unable to download JSON metadata')
+                if kwargs.get('fatal'):
+                    raise ExtractorError(errmsg)
+                else:
+                    self.report_warning(errmsg)
+        return json.get('data')
+
+    def json2srt(self, json):
+        data = '\n\n'.join(
+            f'{i + 1}\n{srt_subtitles_timecode(line["from"])} --> {srt_subtitles_timecode(line["to"])}\n{line["content"]}'
+            for i, line in enumerate(traverse_obj(json, (
+                'body', lambda _, l: l['content'] and l['from'] and l['to']))))
+        return data
+
+    def _get_subtitles(self, *, ep_id=None, aid=None):
+        sub_json = self._call_api(
+            '/web/v2/subtitle', ep_id or aid, fatal=False,
+            note='Downloading subtitles list', errnote='Unable to download subtitles list',
+            query=filter_dict({
+                'platform': 'web',
+                's_locale': 'en_US',
+                'episode_id': ep_id,
+                'aid': aid,
+            })) or {}
+        subtitles = {}
+        for sub in sub_json.get('subtitles') or []:
+            sub_url = sub.get('url')
+            if not sub_url:
+                continue
+            sub_data = self._download_json(
+                sub_url, ep_id or aid, errnote='Unable to download subtitles', fatal=False,
+                note='Downloading subtitles%s' % f' for {sub["lang"]}' if sub.get('lang') else '')
+            if not sub_data:
+                continue
+            subtitles.setdefault(sub.get('lang_key', 'en'), []).append({
+                'ext': 'srt',
+                'data': self.json2srt(sub_data)
+            })
+        return subtitles
+
+    def _get_formats(self, *, ep_id=None, aid=None):
+        video_json = self._call_api(
+            '/web/playurl', ep_id or aid, note='Downloading video formats',
+            errnote='Unable to download video formats', query=filter_dict({
+                'platform': 'web',
+                'ep_id': ep_id,
+                'aid': aid,
+            }))
+        video_json = video_json['playurl']
+        formats = []
+        for vid in video_json.get('video') or []:
+            video_res = vid.get('video_resource') or {}
+            video_info = vid.get('stream_info') or {}
+            if not video_res.get('url'):
+                continue
+            formats.append({
+                'url': video_res['url'],
+                'ext': 'mp4',
+                'format_note': video_info.get('desc_words'),
+                'width': video_res.get('width'),
+                'height': video_res.get('height'),
+                'vbr': video_res.get('bandwidth'),
+                'acodec': 'none',
+                'vcodec': video_res.get('codecs'),
+                'filesize': video_res.get('size'),
+            })
+        for aud in video_json.get('audio_resource') or []:
+            if not aud.get('url'):
+                continue
+            formats.append({
+                'url': aud['url'],
+                'ext': 'mp4',
+                'abr': aud.get('bandwidth'),
+                'acodec': aud.get('codecs'),
+                'vcodec': 'none',
+                'filesize': aud.get('size'),
+            })
+
+        return formats
+
+    def _parse_video_metadata(self, video_data):
+        return {
+            'title': video_data.get('title_display') or video_data.get('title'),
+            'thumbnail': video_data.get('cover'),
+            'episode_number': int_or_none(self._search_regex(
+                r'^E(\d+)(?:$| - )', video_data.get('title_display') or '', 'episode number', default=None)),
+        }
+
+    # def _perform_login(self, username, password):
+    #     if not Cryptodome.RSA:
+    #         raise ExtractorError('pycryptodomex not found. Please install', expected=True)
+
+    #     key_data = self._download_json(
+    #         'https://passport.bilibili.tv/x/intl/passport-login/web/key?lang=en-US', None,
+    #         note='Downloading login key', errnote='Unable to download login key')['data']
+
+    #     public_key = Cryptodome.RSA.importKey(key_data['key'])
+    #     password_hash = Cryptodome.PKCS1_v1_5.new(public_key).encrypt((key_data['hash'] + password).encode('utf-8'))
+    #     login_post = self._download_json(
+    #         'https://passport.bilibili.tv/x/intl/passport-login/web/login/password?lang=en-US', None, data=urlencode_postdata({
+    #             'username': username,
+    #             'password': base64.b64encode(password_hash).decode('ascii'),
+    #             'keep_me': 'true',
+    #             's_locale': 'en_US',
+    #             'isTrusted': 'true'
+    #         }), note='Logging in', errnote='Unable to log in')
+    #     if login_post.get('code'):
+    #         if login_post.get('message'):
+    #             raise ExtractorError(f'Unable to log in: {self.IE_NAME} said: {login_post["message"]}', expected=True)
+    #         else:
+    #             raise ExtractorError('Unable to log in')
+    
+    def _search_json_BiliBili(self, start_pattern, string, name, video_id, *, end_pattern='',
+                     contains_pattern=r'{(?s:.+)}', default={}, **kwargs):
+        """Searches string for the JSON object specified by start_pattern"""
+        # NB: end_pattern is only used to reduce the size of the initial match
+
+        json_string = self._search_regex(
+            rf'(?:{start_pattern})\s*(?P<json>{contains_pattern})\s*(?:{end_pattern})',
+            string, name, group='json', fatal=False, default=None)
+        if not json_string:
+            return default
+
+        return self._parse_json(json_string, video_id, ignore_extra=True, **kwargs)
+
+class BiliIntlIE(BiliIntlBaseIE):
+    _VALID_URL = r'https?://(?:www\.)?bili(?:bili\.tv|intl\.com)/(?:[a-zA-Z]{2}/)?(play/(?P<season_id>\d+)/(?P<ep_id>\d+)|video/(?P<aid>\d+))'
+    _TESTS = [{
+        # Bstation page
+        'url': 'https://www.bilibili.tv/en/play/34613/341736',
+        'info_dict': {
+            'id': '341736',
+            'ext': 'mp4',
+            'title': 'E2 - The First Night',
+            'thumbnail': r're:^https://pic\.bstarstatic\.com/ogv/.+\.png$',
+            'episode_number': 2,
+            'upload_date': '20201009',
+            'episode': 'Episode 2',
+            'timestamp': 1602259500,
+            'description': 'md5:297b5a17155eb645e14a14b385ab547e',
+            'chapters': [{
+                'start_time': 0,
+                'end_time': 76.242,
+                'title': '<Untitled Chapter 1>'
+            }, {
+                'start_time': 76.242,
+                'end_time': 161.161,
+                'title': 'Intro'
+            }, {
+                'start_time': 1325.742,
+                'end_time': 1403.903,
+                'title': 'Outro'
+            }],
+        }
+    }, {
+        # Non-Bstation page
+        'url': 'https://www.bilibili.tv/en/play/1033760/11005006',
+        'info_dict': {
+            'id': '11005006',
+            'ext': 'mp4',
+            'title': 'E3 - Who?',
+            'thumbnail': r're:^https://pic\.bstarstatic\.com/ogv/.+\.png$',
+            'episode_number': 3,
+            'description': 'md5:e1a775e71a35c43f141484715470ad09',
+            'episode': 'Episode 3',
+            'upload_date': '20211219',
+            'timestamp': 1639928700,
+            'chapters': [{
+                'start_time': 0,
+                'end_time': 88.0,
+                'title': '<Untitled Chapter 1>'
+            }, {
+                'start_time': 88.0,
+                'end_time': 156.0,
+                'title': 'Intro'
+            }, {
+                'start_time': 1173.0,
+                'end_time': 1259.535,
+                'title': 'Outro'
+            }],
+        }
+    }, {
+        # Subtitle with empty content
+        'url': 'https://www.bilibili.tv/en/play/1005144/10131790',
+        'info_dict': {
+            'id': '10131790',
+            'ext': 'mp4',
+            'title': 'E140 - Two Heartbeats: Kabuto\'s Trap',
+            'thumbnail': r're:^https://pic\.bstarstatic\.com/ogv/.+\.png$',
+            'episode_number': 140,
+        },
+        'skip': 'According to the copyright owner\'s request, you may only watch the video after you log in.'
+    }, {
+        'url': 'https://www.bilibili.tv/en/video/2041863208',
+        'info_dict': {
+            'id': '2041863208',
+            'ext': 'mp4',
+            'timestamp': 1670874843,
+            'description': 'Scheduled for April 2023.\nStudio: ufotable',
+            'thumbnail': r're:https?://pic[-\.]bstarstatic.+/ugc/.+\.jpg$',
+            'upload_date': '20221212',
+            'title': 'Kimetsu no Yaiba Season 3 Official Trailer - Bstation',
+        },
+    }, {
+        # episode comment extraction
+        'url': 'https://www.bilibili.tv/en/play/34580/340317',
+        'info_dict': {
+            'id': '340317',
+            'ext': 'mp4',
+            'timestamp': 1604057820,
+            'upload_date': '20201030',
+            'episode_number': 5,
+            'title': 'E5 - My Own Steel',
+            'description': 'md5:2b17ab10aebb33e3c2a54da9e8e487e2',
+            'thumbnail': r're:https?://pic\.bstarstatic\.com/ogv/.+\.png$',
+            'episode': 'Episode 5',
+            'comment_count': int,
+            'chapters': [{
+                'start_time': 0,
+                'end_time': 61.0,
+                'title': '<Untitled Chapter 1>'
+            }, {
+                'start_time': 61.0,
+                'end_time': 134.0,
+                'title': 'Intro'
+            }, {
+                'start_time': 1290.0,
+                'end_time': 1379.0,
+                'title': 'Outro'
+            }],
+        },
+        'params': {
+            'getcomments': True
+        }
+    }, {
+        # user generated content comment extraction
+        'url': 'https://www.bilibili.tv/en/video/2045730385',
+        'info_dict': {
+            'id': '2045730385',
+            'ext': 'mp4',
+            'description': 'md5:693b6f3967fb4e7e7764ea817857c33a',
+            'timestamp': 1667891924,
+            'upload_date': '20221108',
+            'title': 'That Time I Got Reincarnated as a Slime: Scarlet Bond - Official Trailer 3| AnimeStan - Bstation',
+            'comment_count': int,
+            'thumbnail': 'https://pic.bstarstatic.com/ugc/f6c363659efd2eabe5683fbb906b1582.jpg',
+        },
+        'params': {
+            'getcomments': True
+        }
+    }, {
+        # episode id without intro and outro
+        'url': 'https://www.bilibili.tv/en/play/1048837/11246489',
+        'info_dict': {
+            'id': '11246489',
+            'ext': 'mp4',
+            'title': 'E1 - Operation \'Strix\' <Owl>',
+            'description': 'md5:b4434eb1a9a97ad2bccb779514b89f17',
+            'timestamp': 1649516400,
+            'thumbnail': 'https://pic.bstarstatic.com/ogv/62cb1de23ada17fb70fbe7bdd6ff29c29da02a64.png',
+            'episode': 'Episode 1',
+            'episode_number': 1,
+            'upload_date': '20220409',
+        },
+    }, {
+        'url': 'https://www.biliintl.com/en/play/34613/341736',
+        'only_matching': True,
+    }, {
+        # User-generated content (as opposed to a series licensed from a studio)
+        'url': 'https://bilibili.tv/en/video/2019955076',
+        'only_matching': True,
+    }, {
+        # No language in URL
+        'url': 'https://www.bilibili.tv/video/2019955076',
+        'only_matching': True,
+    }, {
+        # Uppercase language in URL
+        'url': 'https://www.bilibili.tv/EN/video/2019955076',
+        'only_matching': True,
+    }]
+
+    def _make_url(video_id, series_id=None):
+        if series_id:
+            return f'https://www.bilibili.tv/en/play/{series_id}/{video_id}'
+        return f'https://www.bilibili.tv/en/video/{video_id}'
+
+    def _extract_video_metadata(self, url, video_id, season_id):
+        url, smuggled_data = unsmuggle_url(url, {})
+        if smuggled_data.get('title'):
+            return smuggled_data
+
+        webpage = self._download_webpage(url, video_id)
+        # Bstation layout
+        initial_data = (
+            self._search_json_BiliBili(r'window\.__INITIAL_(?:DATA|STATE)__\s*=', webpage, 'preload state', video_id, default={})
+            or self._search_nuxt_data(webpage, video_id, '__initialState', fatal=False, traverse=None))
+        video_data = traverse_obj(
+            initial_data, ('OgvVideo', 'epDetail'), ('UgcVideo', 'videoData'), ('ugc', 'archive'), expected_type=dict) or {}
+
+        if season_id and not video_data:
+            # Non-Bstation layout, read through episode list
+            season_json = self._call_api(f'/web/v2/ogv/play/episodes?season_id={season_id}&platform=web', video_id)
+            video_data = traverse_obj(season_json, (
+                'sections', ..., 'episodes', lambda _, v: str(v['episode_id']) == video_id
+            ), expected_type=dict, get_all=False)
+
+        # XXX: webpage metadata may not accurate, it just used to not crash when video_data not found
+        return merge_dicts(
+            self._parse_video_metadata(video_data), self._search_json_ld(webpage, video_id, fatal=False), {
+                'title': self._html_search_meta('og:title', webpage),
+                'description': self._html_search_meta('og:description', webpage)
+            })
+
+    def _get_comments_reply(self, root_id, next_id=0, display_id=None):
+        comment_api_raw_data = self._download_json(
+            'https://api.bilibili.tv/reply/web/detail', display_id,
+            note=f'Downloading reply comment of {root_id} - {next_id}',
+            query={
+                'platform': 'web',
+                'ps': 20,  # comment's reply per page (default: 3)
+                'root': root_id,
+                'next': next_id,
+            })
+
+        for replies in traverse_obj(comment_api_raw_data, ('data', 'replies', ...)):
+            yield {
+                'author': traverse_obj(replies, ('member', 'name')),
+                'author_id': traverse_obj(replies, ('member', 'mid')),
+                'author_thumbnail': traverse_obj(replies, ('member', 'face')),
+                'text': traverse_obj(replies, ('content', 'message')),
+                'id': replies.get('rpid'),
+                'like_count': int_or_none(replies.get('like_count')),
+                'parent': replies.get('parent'),
+                'timestamp': unified_timestamp(replies.get('ctime_text'))
+            }
+
+        if not traverse_obj(comment_api_raw_data, ('data', 'cursor', 'is_end')):
+            yield from self._get_comments_reply(
+                root_id, comment_api_raw_data['data']['cursor']['next'], display_id)
+
+    def _get_comments(self, video_id, ep_id):
+        for i in itertools.count(0):
+            comment_api_raw_data = self._download_json(
+                'https://api.bilibili.tv/reply/web/root', video_id,
+                note=f'Downloading comment page {i + 1}',
+                query={
+                    'platform': 'web',
+                    'pn': i,  # page number
+                    'ps': 20,  # comment per page (default: 20)
+                    'oid': video_id,
+                    'type': 3 if ep_id else 1,  # 1: user generated content, 3: series content
+                    'sort_type': 1,  # 1: best, 2: recent
+                })
+
+            for replies in traverse_obj(comment_api_raw_data, ('data', 'replies', ...)):
+                yield {
+                    'author': traverse_obj(replies, ('member', 'name')),
+                    'author_id': traverse_obj(replies, ('member', 'mid')),
+                    'author_thumbnail': traverse_obj(replies, ('member', 'face')),
+                    'text': traverse_obj(replies, ('content', 'message')),
+                    'id': replies.get('rpid'),
+                    'like_count': int_or_none(replies.get('like_count')),
+                    'timestamp': unified_timestamp(replies.get('ctime_text')),
+                    'author_is_uploader': bool(traverse_obj(replies, ('member', 'type'))),
+                }
+                if replies.get('count'):
+                    yield from self._get_comments_reply(replies.get('rpid'), display_id=video_id)
+
+            if traverse_obj(comment_api_raw_data, ('data', 'cursor', 'is_end')):
+                break
+
+    def _real_extract(self, url):
+        season_id, ep_id, aid = self._match_valid_url(url).group('season_id', 'ep_id', 'aid')
+        video_id = ep_id or aid
+        chapters = None
+
+        if ep_id:
+            intro_ending_json = self._call_api(
+                f'/web/v2/ogv/play/episode?episode_id={ep_id}&platform=web',
+                video_id, fatal=False) or {}
+            if intro_ending_json.get('skip'):
+                # FIXME: start time and end time seems a bit off a few second even it corrext based on ogv.*.js
+                # ref: https://p.bstarstatic.com/fe-static/bstar-web-new/assets/ogv.2b147442.js
+                chapters = [{
+                    'start_time': float_or_none(traverse_obj(intro_ending_json, ('skip', 'opening_start_time')), 1000),
+                    'end_time': float_or_none(traverse_obj(intro_ending_json, ('skip', 'opening_end_time')), 1000),
+                    'title': 'Intro'
+                }, {
+                    'start_time': float_or_none(traverse_obj(intro_ending_json, ('skip', 'ending_start_time')), 1000),
+                    'end_time': float_or_none(traverse_obj(intro_ending_json, ('skip', 'ending_end_time')), 1000),
+                    'title': 'Outro'
+                }]
+
+        return {
+            'id': video_id,
+            **self._extract_video_metadata(url, video_id, season_id),
+            'formats': self._get_formats(ep_id=ep_id, aid=aid),
+            'subtitles': self.extract_subtitles(ep_id=ep_id, aid=aid),
+            'chapters': chapters,
+            #'__post_extractor': self.extract_comments(video_id, ep_id)
+        }

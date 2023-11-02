@@ -132,6 +132,7 @@ from .kinja import KinjaEmbedIE
 from .arcpublishing import ArcPublishingIE
 from .medialaan import MedialaanIE
 from .simplecast import SimplecastIE
+from .bilibili import BiliBiliIE
 
 
 class GenericIE(InfoExtractor):
@@ -2827,7 +2828,7 @@ class GenericIE(InfoExtractor):
             webpage, 'vid.me embed', default=None)
         if vid_me_embed_url is not None:
             return self.url_result(vid_me_embed_url, 'Vidme')
-
+        
         # Look for YouTube embeds
         youtube_urls = YoutubeIE._extract_urls(webpage)
         if youtube_urls:
