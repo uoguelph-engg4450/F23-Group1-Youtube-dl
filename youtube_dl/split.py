@@ -1,37 +1,41 @@
-import argparse
-import os
-import datetime
+#Splits livestream into clips with defined lengths
+#
+
+#Reference sources
+#   https://www.knowledgehut.com/blog/programming/sys-argv-python-examples
+#   https://artwilton.medium.com/running-ffmpeg-commands-from-a-python-script-676eaf2b2739
+
+#if testing use the output from python youtube_dl -g <url>
+
+import sys
 import subprocess
-import mp
-def download_video(youtube_url, output_file):
-    subprocess.run(['youtube-dl', '-o', output_file, youtube_url])
+import getopt
 
-def create_clip(input_file, output_file, start_time, end_time):
-    mp.moviepy.io.ffmpeg_extract_subclip(input_file, start_time, end_time, targetname=output_file)
+def split_live(duration = "00:01:00.00", numClips = 1, ffmpeg = None):
+    argv = sys.argv[1:]
 
-def main():
-    parser = argparse.ArgumentParser(description='YouTube Livestream Clip Generator')
-    parser.add_argument('url', help='YouTube Livestream URL')
-    parser.add_argument('-o', '--output-dir', default='.', help='Output directory for the clip')
-    args = parser.parse_args()
+    #for test runs
+    if argv != None:
+        url = argv[0]
+        duration = argv[1]
+        numClips = argv[2]
 
-    # Get current time
-    current_time = datetime.datetime.now()
-    end_time = current_time.strftime("%H:%M:%S")
+        #set ffmpeg location if needed
+        opt, arg = getopt.getopt(argv, "f", "ffmpeg=")
 
-    # Calculate start time (2 minutes before the current time)
-    start_time_delta = datetime.timedelta(minutes=2)
-    start_time = (current_time - start_time_delta).strftime("%H:%M:%S")
+    for name, value in opt:
+        if name in ['-f', '--ffmpeg']:
+            ffmpeg = value
 
-    # Define filenames and paths
-    output_filename = 'output.mp4'
-    output_path = os.path.join(args.output_dir, output_filename)
+    commands = [ffmpeg, '-i', url, '-t', duration, '-c', "copy", "clip.mp4"]
 
-    # Download the video
-    download_video(args.url, output_path)
+    for i in numClips:
+        clipName = "clip" + str(i) +".mp4"
+        commands[7] = clipName
 
-    # Create the clip
-    create_clip(output_path, output_path, start_time, end_time)
+        if subprocess.run(commands).returncode != 0:
+            print("Split livestream error")
+            return 0
+    
+    print("Livestream clips downloaded")
 
-if __name__ == "__main__":
-    main()
